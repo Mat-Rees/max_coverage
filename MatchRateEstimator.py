@@ -30,16 +30,20 @@ class MatchRateEstimator:
         
         args = self.args()
         print(args)
-        
         # get CLI args
         config_file = args.config
         input_numbers = args.input_numbers
         self.results_file = args.output_file
         self.country_code = args.country_code
-        
+        self.waterfall_mode = args.waterfall_mode
+        if self.waterfall_mode not in ['on','off']:
+            print('waterfall_mode must either be <on> or <off>')
+            quit()
         # make some variables
         self.config = self.load_config(config_file)
         self.sources = self.config['sources']
+        
+        self.latency_catch = []
         
         #  check no output file exists, so not to overwrite previous results
         cwd = os.getcwd()
@@ -47,8 +51,7 @@ class MatchRateEstimator:
         if os.path.exists(my_file):
             print('exiting as target output file already exists')
             quit()
-            
-
+        
         # load numbers file as list object
         with open(input_numbers) as num_file:
             self.input_nums = num_file.read().splitlines()
@@ -56,9 +59,6 @@ class MatchRateEstimator:
         # DataFrame for holding results from different api's
         self.results = pd.DataFrame(self.input_nums, columns=['numbers'])
         
-        # list of numbers that's reduced after every API batch call so that 
-        # only still unidentified numbers are queried to the next API
-        self.unknown_numbers = []
         
         # Connect to AWS resource...
         # Requires $AWS_PROFILE environment variable to be set
@@ -72,6 +72,8 @@ class MatchRateEstimator:
         if len(self.country_code) > 2:
             print('country code input must be less that 2 characters')
             quit()
+        
+    
             
         
     
@@ -85,6 +87,8 @@ class MatchRateEstimator:
                             help="Results file target filepath")
         parser.add_argument("country_code", type=str,
                             help="2-letter ISO country code")
+        parser.add_argument("waterfall_mode", type=str,
+                            help="Waterfall mode on/off. Waterfall mode reduces ID'd numbers from the input_numbers list ")
         args = parser.parse_args()
         return args
         
@@ -99,46 +103,53 @@ class MatchRateEstimator:
     
     
     def query_controller(self, config, num_list):
-        
         sources = self.config['sources']
         
+        # list of numbers that's reduced after every API batch call so that 
+        # only still unidentified numbers are queried to the next API
+        self.unknown_numbers = []
         
         for i in sources:
             
             if i=='infobel':              
                 print('- - starting infobel')
+                self.infobel_latency=[]
                 url_base = self.config['url_strings']['infobel']
                 user = self.config['credentials']['infobel']['username']
                 password = self.config['credentials']['infobel']['password']
                 self.infobel_loop(url_base, user, password, num_list)
+                self.latency_catch.append(['infobel', np.mean(self.infobel_latency)])
+                
                 print('- - infobel done')
                 
                 
-                
+        
             if i=='telo':
                 print('- - starting telo')
+                self.telo_latency=[]
                 telo_results=[]
                 url_base = self.config['url_strings']['telo']
                 a_sid = self.config['credentials']['telo']['account_sid']
-                a_token = self.config['credentials']['telo']['authtoken']
-                
+                a_token = self.config['credentials']['telo']['authtoken']         
                 for num in num_list:
                     url_string = url_base.format(num, a_sid, a_token)
                     name, code = self.telo_call(url_string)
                     telo_results.append([num, code, name])
                 
                 telo_df = pd.DataFrame(telo_results, columns=['numbers','telo_res_desc','telo_name'])
-                new_num_list = self.filter_matched_numbers(telo_results)
-                num_list = new_num_list
+                 
+                if self.waterfall_mode == 'on':
+                     new_num_list = self.filter_matched_numbers(telo_results)
+                     num_list = new_num_list
                 
                 self.results = self.results.join(telo_df.set_index('numbers'), on='numbers')
+                self.latency_catch.append(['telo', np.mean(self.telo_latency)])
                 print('- - telo done')
-                # loop through numbers, send to telo
-                
                 
                 
             if i=='hiya':
                 print('- - starting hiya')
+                
                 hiya_results=[]
                 
                 table = self.dynamoDB.Table('id_data.prod.identity_cache')
@@ -148,9 +159,11 @@ class MatchRateEstimator:
                     hiya_results.append([num, code, name])
                     
                 hiya_df = pd.DataFrame(hiya_results, columns=['numbers','hiya_res_desc','hiya_name'])
-                new_num_list = self.filter_matched_numbers(hiya_results)
-                num_list = new_num_list
                 
+                if self.waterfall_mode == 'on':
+                    new_num_list = self.filter_matched_numbers(hiya_results)
+                    num_list = new_num_list
+                 
                 self.results = self.results.join(hiya_df.set_index('numbers'), on='numbers')
                 print('- - hiya done')
                 
@@ -166,31 +179,41 @@ class MatchRateEstimator:
                     yelp_results.append([num, code, name])
                 
                 yelp_df = pd.DataFrame(yelp_results, columns=['numbers','yelp_res_desc','yelp_name'])
-                new_num_list = self.filter_matched_numbers(yelp_results)
-                num_list = new_num_list
+                if self.waterfall_mode == 'on':
+                    new_num_list = self.filter_matched_numbers(yelp_results)
+                    num_list = new_num_list
                 self.results = self.results.join(yelp_df.set_index('numbers'), on='numbers')
                 print('- - yelp done')
                 
+                
+                
             if i=='navagis':
                 print('- - starting navagis')
+                self.navagis_latency=[]
                 navagis_results=[]
                 url_base = self.config['url_strings']['navagis']
                 api_key = self.config['credentials']['navagis']['api_key']
+            
                 
                 for num in num_list:
                     url_string = url_base.format(num, api_key)
                     name, code = self.navagis_call(url_string)
                     navagis_results.append([num, code, name])
                 navagis_df = pd.DataFrame(navagis_results, columns=['numbers','navagis_res_desc','navagis_name'])
-                new_num_list = self.filter_matched_numbers(navagis_results)
-                num_list = new_num_list
+                
+                if self.waterfall_mode == 'on':
+                    new_num_list = self.filter_matched_numbers(navagis_results)
+                    num_list = new_num_list
                 
                 self.results = self.results.join(navagis_df.set_index('numbers'), on='numbers') 
+                self.latency_catch.append(['navagis', np.mean(self.navagis_latency)])
                 print('- - navagis done')
+                
                 
             if i=='whitepages':
                 print('- - starting whitepages')
                 whitepages_results = []
+                self.whitepages_latency=[]
                 url_base = self.config['url_strings']['whitepages']
                 api_key = self.config['credentials']['whitepages']['token']
                 
@@ -199,10 +222,12 @@ class MatchRateEstimator:
                     name, code = self.whitepages_call(url_string)
                     whitepages_results.append([num, code, name])
                 whitepages_df = pd.DataFrame(whitepages_results, columns=['numbers','whitepages_res_desc','whitepages_name'])
-                new_num_list = self.filter_matched_numbers(whitepages_results)
-                num_list = new_num_list
+                if self.waterfall_mode == 'on':
+                    new_num_list = self.filter_matched_numbers(whitepages_results)
+                    num_list = new_num_list
                 
                 self.results = self.results.join(whitepages_df.set_index('numbers'), on='numbers') 
+                self.latency_catch.append(['whitepages', np.mean(self.whitepages_latency)])
                 print('- - whitepages done')
             
         print(self.results)
@@ -241,6 +266,7 @@ class MatchRateEstimator:
         return name, code
         
         
+    
     def yelp_internal(self, dynamoTable, num):
         response = dynamoTable.query(KeyConditionExpression=Key('phone').eq(num))
         if response['Items'] != [] and len(response['Items'])>2:
@@ -260,6 +286,9 @@ class MatchRateEstimator:
         
     def infobel_call(self, url):
         r = requests.get(url)
+        
+        self.infobel_latency.append(r.elapsed.total_seconds())
+        
         if r.ok:
             resp = json.loads(r.text)
             name = resp['Result']['FullName']
@@ -285,8 +314,9 @@ class MatchRateEstimator:
             infobel_results.append([num, code, name])
                     
         infobel_df = pd.DataFrame(infobel_results, columns=['numbers','infobel_res_desc','infobel_name'])
-        new_num_list = self.filter_matched_numbers(infobel_results)
-        num_list = new_num_list
+        if self.waterfall_mode == 'on': 
+            new_num_list = self.filter_matched_numbers(infobel_results)
+            num_list = new_num_list
         self.results = self.results.join(infobel_df.set_index('numbers'), on='numbers')
     
     
@@ -294,6 +324,7 @@ class MatchRateEstimator:
     
     def telo_call(self, url):
         r = requests.get(url)
+        self.telo_latency.append(r.elapsed.total_seconds())
         if r.ok:
             resp = json.loads(r.text)
             if resp['data']:
@@ -314,6 +345,7 @@ class MatchRateEstimator:
     
     def whitepages_call(self, url):
         r = requests.get(url)
+        self.whitepages_latency.append(r.elapsed.total_seconds())
         if r.ok:
             resp = json.loads(r.text)
             
@@ -338,6 +370,7 @@ class MatchRateEstimator:
 
     def navagis_call(self, url):
         r = requests.get(url)
+        self.navagis_latency.append(r.elapsed.total_seconds())
         if r.ok:
             resp = json.loads(r.text)
             if resp['status']!='OK':
@@ -359,7 +392,11 @@ class MatchRateEstimator:
             DF.to_pickle(fname)
         else:
             DF.to_csv(fname)
+            
     
+    def make_boolean_matrix(self, infile):
+        # this converts the output file into boolean values to do overlap + cost estimation. 
+        dt = 1
     
 
     def make_plot_data(self, DF, sources):
@@ -371,9 +408,9 @@ class MatchRateEstimator:
         for source in sources:
             
             col_heading = "{0}_res_desc".format(source)
-            print(DF.numbers.count())
+            #print(DF.numbers.count())
             match_count = DF[DF[col_heading]=='M'].count()[col_heading]
-            print(match_count)
+            #print(match_count)
             matched_names_by_source.append([self.country_code, current_dt, source, match_count, DF.numbers.count()])
             
             
@@ -408,6 +445,7 @@ if __name__ == "__main__":
     
     mre.make_plot_data(mre.results, mre.sources)
     mre.saveDF(mre.results, mre.results_file)
+    print( mre.latency_catch)
     
     print('end')
     
