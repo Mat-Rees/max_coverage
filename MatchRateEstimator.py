@@ -22,6 +22,8 @@ import datetime
 from sqlalchemy import create_engine
 
 
+# run as: 
+# python MatchRateEstimator.py config input_numbers output_file countrycode waterfall_mode
 
 class MatchRateEstimator:
 
@@ -62,7 +64,7 @@ class MatchRateEstimator:
         
         # Connect to AWS resource...
         # Requires $AWS_PROFILE environment variable to be set
-        if 'hiya' or 'yelp' in self.config['sources']:
+        if 'hiya' or 'scp' or 'yelp' in self.config['sources']:
             AWS_PROFILE = self.config['AWS']['AWS_PROFILE']
             AWS_Region = self.config['AWS']['Region']
             self.dynamoDB = self.dynamoConn(AWS_PROFILE, 'dynamodb', AWS_Region)
@@ -119,9 +121,20 @@ class MatchRateEstimator:
                 password = self.config['credentials']['infobel']['password']
                 self.infobel_loop(url_base, user, password, num_list)
                 self.latency_catch.append(['infobel', np.mean(self.infobel_latency)])
-                
                 print('- - infobel done')
                 
+                
+            if i=='telesign':
+                print('- - starting telesign')
+                self.telesign_latency=[]
+                url_base = self.config['url_strings']['telesign']
+                user = self.config['credentials']['telesign']['user']
+                api_key = self.config['credentials']['telesign']['api_key']
+                auth = (user, api_key)
+                data = self.config['credentials']['telesign']['data']
+                self.telesign_loop(url_base, auth, data, num_list)
+                self.latency_catch.append(['telesign', np.mean(self.telesign_latency)])
+                print('- - telesign done')
                 
         
             if i=='telo':
@@ -148,17 +161,15 @@ class MatchRateEstimator:
                 
                 
             if i=='hiya':
-                print('- - starting hiya')
-                
+                print('- - starting hiya')               
                 hiya_results=[]
-                
-                table = self.dynamoDB.Table('id_data.prod.identity_cache')
-                
+                table = self.dynamoDB.Table('cps.prod.unifiedcache')
+       
                 for num in num_list:
-                    name, code = self.hiya_internal(table, num)
-                    hiya_results.append([num, code, name])
+                    name, code, conf = self.hiya_internal(table, num)
+                    hiya_results.append([num, code, name, conf])
                     
-                hiya_df = pd.DataFrame(hiya_results, columns=['numbers','hiya_res_desc','hiya_name'])
+                hiya_df = pd.DataFrame(hiya_results, columns=['numbers','hiya_res_desc','hiya_name','hiya_conf'])
                 
                 if self.waterfall_mode == 'on':
                     new_num_list = self.filter_matched_numbers(hiya_results)
@@ -166,6 +177,25 @@ class MatchRateEstimator:
                  
                 self.results = self.results.join(hiya_df.set_index('numbers'), on='numbers')
                 print('- - hiya done')
+                
+                
+            if i=='scp':
+                print('- - starting scp')               
+                scp_results=[]
+                table = self.dynamoDB.Table('cps.prod.unifiedcache')
+       
+                for num in num_list:
+                    name, code = self.hiya_scp(table, num)
+                    scp_results.append([num, code, name])
+                    
+                scp_df = pd.DataFrame(scp_results, columns=['numbers','scp_res_desc','scp_name'])
+                
+                if self.waterfall_mode == 'on':
+                    new_num_list = self.filter_matched_numbers(scp_results)
+                    num_list = new_num_list
+                 
+                self.results = self.results.join(scp_df.set_index('numbers'), on='numbers')
+                print('- - scp done')
                 
                 
                 
@@ -210,6 +240,7 @@ class MatchRateEstimator:
                 print('- - navagis done')
                 
                 
+                
             if i=='whitepages':
                 print('- - starting whitepages')
                 whitepages_results = []
@@ -248,18 +279,44 @@ class MatchRateEstimator:
         return dynamodb
     
     
+    def check_cps_cache(self, typeKey, phone_num, dynamoTable):
+        response = dynamoTable.query(KeyConditionExpression=Key('phone').eq(phone_num)
+            & Key('typeKey').eq(typeKey))
+        return response
     
         
+    
     def hiya_internal(self, dynamoTable, num):
-        response = dynamoTable.query(KeyConditionExpression=Key('phone').eq(num))
-        if response['Items'] != []:
-            if response['Items'][0]['name'] is None:
+        
+        res = self.check_cps_cache('nelv1', num, dynamoTable)
+        if res['Items'] != []:
+            payload = res['Items'][0]['payload']
+            pl = json.loads(payload)
+            if pl['type']=='NoIdentity':
                 name=''
                 code='Name Unavailable, Rep Only(?)'
+                conf=''
             else:
-                name=response['Items'][0]['name']
-                code='M'
+                name = pl['name']
+                code = 'M'
+                conf = pl['confidence']
                 print(name)
+        else:
+            name=''
+            code='NM'
+            conf=''
+        return name, code, conf
+                    
+                    
+                    
+    def hiya_scp(self, dynamoTable, num):
+        res = self.check_cps_cache('scpv1', num, dynamoTable)
+        if res['Items'] != []:
+            payload = res['Items'][0]['payload']
+            pl = json.loads(payload)
+            name = pl['displayName']
+            code = 'M'
+            print(name)
         else:
             name=''
             code='NM'
@@ -339,9 +396,50 @@ class MatchRateEstimator:
             code = 'F'
         
         return name, code
+    
        
+    def telesign_loop(self, url_base, auth, data, num_list):
+        telesign_results = []
+        for num in num_list:              
+            num_edit = num.replace("/","")
+            url_string = url_base.format(num_edit)
+            name, code = self.telesign_call(url_string, auth, data)
+            telesign_results.append([num, code, name])
+        
+        telesign_df = pd.DataFrame(telesign_results, columns=['numbers','telesign_res_desc','telesign_name'])
+        if self.waterfall_mode == 'on': 
+            new_num_list = self.filter_matched_numbers(telesign_results)
+            num_list = new_num_list
+        self.results = self.results.join(telesign_df.set_index('numbers'), on='numbers')
+        
+        
     
+    def telesign_call(self, url, auth, data):
+        
+        r = requests.post(url, auth=auth, data=data)
+        self.telesign_latency.append(r.elapsed.total_seconds())
+        if r.ok:
+            js = json.loads(r.text)
+            if js['status']['code'] == 300:
     
+                if js['contact']['status']['code'] == 2800:
+                    firstname = js['contact']['first_name']
+                    surname = js['contact']['last_name']
+                    name = '{0} {1}'.format(firstname, surname)
+                    code='M'
+                    print(name)
+                else:
+                    name=''
+                    code='NM'
+            else:
+                name=''
+                code='F'    
+        else: 
+            name=''
+            code='F'
+
+        return name, code
+        
     
     def whitepages_call(self, url):
         r = requests.get(url)
@@ -350,8 +448,8 @@ class MatchRateEstimator:
             resp = json.loads(r.text)
             
             if resp['belongs_to']:
-                if resp['belongs_to'][0]['name']:
-                    name = resp['belongs_to'][0]['name']
+                if resp['belongs_to']['name']:
+                    name = resp['belongs_to']['name']
                     code = 'M'
                     print(name)
                 else:
@@ -402,7 +500,6 @@ class MatchRateEstimator:
     def make_plot_data(self, DF, sources):
         
         matched_names_by_source = []
-        
         current_dt = datetime.datetime.now()
         
         for source in sources:
